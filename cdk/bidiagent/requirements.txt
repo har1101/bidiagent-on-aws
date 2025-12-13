@@ -1,0 +1,5 @@
+bedrock-agentcore
+strands-agents-tools
+strands-agents[bidi]
+pyaudio>=0.2.14
+starlette

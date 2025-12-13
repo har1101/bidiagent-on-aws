@@ -16,11 +16,7 @@ async def main() -> None:
     # モデルはNova 2 Sonicを使う
     model = BidiNovaSonicModel(
         model_id='amazon.nova-2-sonic-v1:0',
-        provider_config={
-            "audio": {
-                "voice": "tiffany",
-            }
-        },
+        provider_config={"audio": {"voice": "tiffany",}},
     )
 
     # stop_conversation toolは、ユーザーがエージェントの実行を口頭で停止できるようにします。

@@ -1,0 +1,5 @@
+bedrock-agentcore
+strands-agents-tools
+strands-agents[bidi,bidi-all]
+starlette
+uvicorn
