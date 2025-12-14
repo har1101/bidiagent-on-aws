@@ -374,78 +374,143 @@ FORMAT = pyaudio.paInt16   # 16bit PCM
 
 といった問題が発生します。
 
-### 5.2 AudioPlayer クラス（音声再生）
+### 5.2 AudioPlayer クラス（音声再生・割り込み対応）
 
 ```python
 class AudioPlayer:
-    """受信した音声データを再生するクラス"""
+    """受信した音声データを再生するクラス（非同期再生対応）
+
+    別スレッドで音声を再生することで、メインの受信処理をブロックしない。
+    割り込み時にはキューをクリアして即座に再生を停止できる。
+    """
 
     def __init__(self, sample_rate: int = OUTPUT_SAMPLE_RATE):
-        if not PYAUDIO_AVAILABLE:
-            return
-
-        self.pa = pyaudio.PyAudio()  # PyAudioの初期化
-        self._sample_rate = sample_rate
-        self.stream = self.pa.open(
-            format=FORMAT,           # 16bit
-            channels=CHANNELS,       # モノラル
-            rate=sample_rate,        # 16kHz
-            output=True,             # 出力（再生）モード
-            frames_per_buffer=CHUNK_SIZE * 2  # バッファサイズ
-        )
-        self._running = True
+        ...
+        self._audio_queue = queue.Queue()  # 再生キュー
+        self._playback_thread = None       # 再生スレッド
 ```
 
-#### 各行の解説
+#### なぜ別スレッドで再生するのか
 
-**`self.pa = pyaudio.PyAudio()`**
+**問題: ブロッキング再生**
 
-PyAudioライブラリを初期化します。PCのオーディオシステムと接続する準備。
-
-**`self.pa.open(...)`**
-
-スピーカーへの「パイプ」を開きます。
-
-```
-               self.stream
-プログラム ─────────────────→ スピーカー 🔊
-           （データを流す）
+```python
+# ダメなパターン（以前の実装）
+def play(self, audio_bytes: bytes):
+    self.stream.write(audio_bytes)  # ← これがブロッキング！
 ```
 
-**`output=True`**
-
-「出力モード」を指定。`input=True`なら「入力モード（録音）」になる。
-
-**`frames_per_buffer=CHUNK_SIZE * 2`**
-
-バッファ（一時保管場所）のサイズ。大きめにすることで音飛びを防ぐ。
+`stream.write()`は音声の再生が終わるまで処理を返しません。
 
 ```
-データ → [バッファ ████████] → スピーカー
-
-バッファが小さいと:
-データ → [バ ██] → 空っぽ！ → 音が途切れる
-
-バッファが大きいと:
-データ → [バッファ ████████████] → 安定して再生
-         （少し遅延するが途切れない）
+問題の流れ:
+サーバー → 音声データ1 → play() で再生中（32ms待ち）
+サーバー → 音声データ2 → play() で再生中（32ms待ち）
+サーバー → 割り込みイベント → 待たされる！
+　　　　　　　　　　　　　　　→ 音声1,2の再生が終わるまで処理されない
 ```
 
-#### play メソッド
+**解決: 非同期再生（別スレッド）**
+
+```python
+# 良いパターン（現在の実装）
+def play(self, audio_bytes: bytes):
+    self._audio_queue.put(audio_bytes)  # キューに入れるだけ（即座に戻る）
+```
+
+```
+改善後の流れ:
+メインスレッド:
+  サーバー → 音声データ1 → キューに追加（即座）
+  サーバー → 音声データ2 → キューに追加（即座）
+  サーバー → 割り込みイベント → すぐ処理できる！→ clear()でキューを空に
+
+再生スレッド（別スレッド）:
+  キューから取り出し → 再生 → キューから取り出し → 再生...
+  （メインスレッドとは独立して動く）
+```
+
+**例え話：**
+レストランの厨房を想像してください。
+
+- **ブロッキング**: ウェイターが料理を客席に運び終わるまで、次の注文を受けられない
+- **非同期**: ウェイターは注文を厨房に渡すだけ（即座に戻る）。料理は厨房スタッフが別途作る
+
+#### start メソッド
+
+```python
+def start(self):
+    """再生スレッドを開始"""
+    self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+    self._playback_thread.start()
+```
+
+別スレッドで `_playback_loop` を開始します。
+`daemon=True` にすることで、メインプログラム終了時に自動で終了します。
+
+#### _playback_loop メソッド
+
+```python
+def _playback_loop(self):
+    """別スレッドで音声を再生"""
+    while self._running:
+        try:
+            audio_bytes = self._audio_queue.get(timeout=0.1)
+            if audio_bytes is None:  # 終了シグナル
+                break
+            self.stream.write(audio_bytes)
+        except queue.Empty:
+            continue
+```
+
+**処理の流れ:**
+1. キューからデータを取得（最大0.1秒待つ）
+2. データがあれば再生
+3. `None` を受け取ったら終了
+4. 1に戻る
+
+#### play メソッド（ノンブロッキング）
 
 ```python
 def play(self, audio_bytes: bytes):
-    """音声データを再生"""
-    if not PYAUDIO_AVAILABLE or not self._running:
-        return
-    try:
-        self.stream.write(audio_bytes)  # バイトデータをストリームに書き込む
-    except Exception as e:
-        print(f"[AudioPlayer] Error: {e}")
+    """音声データをキューに追加（ノンブロッキング）"""
+    self._audio_queue.put(audio_bytes)
 ```
 
-`stream.write(audio_bytes)` が実際に音を鳴らす部分。
-バイトデータを渡すと、スピーカーから音が出る。
+キューに追加するだけなので、即座に処理が戻ります。
+実際の再生は別スレッドが担当します。
+
+#### clear メソッド（割り込み対応）
+
+```python
+def clear(self):
+    """割り込み時にキューをクリアして再生を即座に停止"""
+    while not self._audio_queue.empty():
+        try:
+            self._audio_queue.get_nowait()
+        except queue.Empty:
+            break
+```
+
+**割り込みとは:**
+ユーザーがAIの発話中に話しかけると、AIの発話が中断される機能です。
+
+```
+AI: 「今日の天気は晴れで気温は──」
+ユーザー: 「ストップ」（割り込み）
+AI: （発話中断）「はい、何でしょうか？」
+```
+
+**clear()の動作:**
+```
+キュー: [音声3] [音声4] [音声5] ← まだ再生されていないデータ
+
+割り込みイベント受信！
+
+clear() 実行
+　↓
+キュー: [] ← 空になる（音声3,4,5は再生されない）
+```
 
 #### stop メソッド
 
@@ -453,16 +518,13 @@ def play(self, audio_bytes: bytes):
 def stop(self):
     """再生を停止"""
     self._running = False
-    if PYAUDIO_AVAILABLE:
-        try:
-            self.stream.stop_stream()  # ストリームを停止
-            self.stream.close()        # ストリームを閉じる
-            self.pa.terminate()        # PyAudioを終了
-        except Exception:
-            pass
+    self._audio_queue.put(None)  # 終了シグナル
+    if self._playback_thread and self._playback_thread.is_alive():
+        self._playback_thread.join(timeout=1.0)  # スレッド終了を待つ
+    ...
 ```
 
-リソースの後片付け。これをしないとメモリリークや次回起動時のエラーの原因になる。
+`None` をキューに入れることで、再生スレッドに「終了してね」と伝えます。
 
 ### 5.3 AudioRecorder クラス（音声録音）
 
@@ -761,6 +823,13 @@ async def receive_messages(websocket, player: AudioPlayer):
                 if is_final:
                     prefix = "Agent" if role == "assistant" else "You"
                     print(f"[{prefix}] {text}")
+
+            # レスポンス完了（割り込み検知）
+            elif msg_type == "bidi_response_complete":
+                reason = data.get("stop_reason", "")
+                if reason == "interrupted":
+                    print("[Agent] (interrupted)")
+                    player.clear()  # 未再生の音声をクリア
 ```
 
 #### async for message in websocket
@@ -775,6 +844,33 @@ WebSocketからメッセージが届くたびに、ループが1回実行され�
 ```
 
 メッセージがない間は「待機」状態になり、CPUを消費しない。
+
+#### 割り込み（Interruption）の処理
+
+ユーザーがAIの発話中に話しかけると、サーバーから `bidi_response_complete` イベントが
+`stop_reason: "interrupted"` 付きで送られてきます。
+
+```
+タイムライン:
+
+AI発話中:
+  サーバー → 音声データ1 → キューに追加
+  サーバー → 音声データ2 → キューに追加
+  サーバー → 音声データ3 → キューに追加
+　　　　　　　　　　　　　　↓
+ユーザー割り込み:
+  サーバー → bidi_response_complete (interrupted) → player.clear() 実行
+　　　　　　　　　　　　　　↓
+  キュー: [音声2] [音声3] → [] （クリアされる）
+　　　　　　　　　　　　　　↓
+新しい応答:
+  サーバー → 新しい音声データ → キューに追加 → 再生
+```
+
+**player.clear() が重要な理由:**
+
+これがないと、ユーザーが割り込んでも、キューに溜まった古い音声が
+全部再生されてしまい、自然な会話になりません。
 
 ---
 
@@ -1001,6 +1097,9 @@ export AWS_PROFILE=your-profile
 | WebSocket | ウェブソケット | 双方向リアルタイム通信プロトコル |
 | PCM | ピーシーエム | 非圧縮の音声データ形式 |
 | Sample Rate | サンプルレート | 1秒間のサンプリング回数 |
+| Interruption | インタラプション | AI発話中にユーザーが話しかけて中断すること |
+| Threading | スレッディング | 複数の処理を並列実行する仕組み |
+| Daemon Thread | デーモンスレッド | メインプログラム終了時に自動終了するスレッド |
 | Mono | モノラル | 1チャンネルの音声 |
 | Stereo | ステレオ | 2チャンネル（左右）の音声 |
 | Base64 | ベースろくじゅうよん | バイナリをテキストに変換する方式 |

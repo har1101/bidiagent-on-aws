@@ -24,6 +24,7 @@ import base64
 import sys
 import os
 import queue
+import threading
 
 # AgentCore Runtime SDK
 from bedrock_agentcore.runtime import AgentCoreRuntimeClient
@@ -49,7 +50,11 @@ FORMAT = pyaudio.paInt16 if PYAUDIO_AVAILABLE else None  # 16bit PCM
 
 
 class AudioPlayer:
-    """受信した音声データを再生するクラス"""
+    """受信した音声データを再生するクラス（非同期再生対応）
+
+    別スレッドで音声を再生することで、メインの受信処理をブロックしない。
+    割り込み時にはキューをクリアして即座に再生を停止できる。
+    """
 
     def __init__(self, sample_rate: int = OUTPUT_SAMPLE_RATE):
         if not PYAUDIO_AVAILABLE:
@@ -62,23 +67,63 @@ class AudioPlayer:
             channels=CHANNELS,
             rate=sample_rate,
             output=True,
-            frames_per_buffer=CHUNK_SIZE * 2  # 出力は大きめのバッファ
+            frames_per_buffer=CHUNK_SIZE  # 小さめのバッファで遅延を減らす
         )
         self._running = True
+        self._audio_queue = queue.Queue()
+        self._playback_thread = None
         print(f"[AudioPlayer] Initialized with sample_rate={sample_rate}")
 
+    def start(self):
+        """再生スレッドを開始"""
+        if not PYAUDIO_AVAILABLE:
+            return
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
+        print("[AudioPlayer] Playback thread started")
+
+    def _playback_loop(self):
+        """別スレッドで音声を再生（ブロッキングをメインスレッドから分離）"""
+        while self._running:
+            try:
+                # タイムアウト付きでキューから取得（停止時にスレッドが終了できるように）
+                audio_bytes = self._audio_queue.get(timeout=0.1)
+                if audio_bytes is None:  # 終了シグナル
+                    break
+                self.stream.write(audio_bytes)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                if self._running:
+                    print(f"[AudioPlayer] Playback error: {e}")
+
     def play(self, audio_bytes: bytes):
-        """音声データを再生"""
+        """音声データをキューに追加（ノンブロッキング）"""
         if not PYAUDIO_AVAILABLE or not self._running:
             return
-        try:
-            self.stream.write(audio_bytes)
-        except Exception as e:
-            print(f"[AudioPlayer] Error: {e}")
+        self._audio_queue.put(audio_bytes)
+
+    def clear(self):
+        """割り込み時にキューをクリアして再生を即座に停止"""
+        if not PYAUDIO_AVAILABLE:
+            return
+        cleared_count = 0
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+                cleared_count += 1
+            except queue.Empty:
+                break
+        if cleared_count > 0:
+            print(f"[AudioPlayer] Cleared {cleared_count} audio chunks (interrupted)")
 
     def stop(self):
         """再生を停止"""
         self._running = False
+        # 終了シグナルを送る
+        self._audio_queue.put(None)
+        if self._playback_thread and self._playback_thread.is_alive():
+            self._playback_thread.join(timeout=1.0)
         if PYAUDIO_AVAILABLE:
             try:
                 self.stream.stop_stream()
@@ -86,6 +131,7 @@ class AudioPlayer:
                 self.pa.terminate()
             except Exception:
                 pass
+        print("[AudioPlayer] Stopped")
 
 
 class AudioRecorder:
@@ -202,8 +248,9 @@ async def audio_session(region: str, runtime_arn: str):
         ) as websocket:
             print("[Connected] WebSocket connection established\n")
 
-            # 録音を開始
+            # 録音と再生を開始
             recorder.start()
+            player.start()
 
             # 送信タスクと受信タスクを並行実行
             send_task = asyncio.create_task(send_audio(websocket, recorder))
@@ -315,6 +362,8 @@ async def receive_messages(websocket, player: AudioPlayer):
                     reason = data.get("stop_reason", "")
                     if reason == "interrupted":
                         print("[Agent] (interrupted)")
+                        # 割り込み時は未再生の音声データをクリアして即座に停止
+                        player.clear()
 
                 # エラー (Strands BidiErrorEvent)
                 elif msg_type == "bidi_error":
